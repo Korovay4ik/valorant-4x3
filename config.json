@@ -1,0 +1,16 @@
+{
+  "ResolutionWidth": 1440,
+  "ResolutionHeight": 992,
+  "RefreshRate": 0,
+  "AspectRatioFill": true,
+  "DisplayMode": "WindowedFullscreen",
+  "MonitorMode": "All",
+  "DisplayDevice": "",
+  "MonitorHwid": "",
+  "LaunchValorant": true,
+  "RiotClientPath": "C:\\Riot Games\\Riot Client\\RiotClientServices.exe",
+  "ValorantProcess": "VALORANT",
+  "LaunchTimeoutMinutes": 5,
+  "LogToFile": false,
+  "PauseOnExit": false
+}
