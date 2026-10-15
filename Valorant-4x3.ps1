@@ -14,15 +14,15 @@
 
     WHAT THIS SCRIPT DOES (everything is reverted in 'finally'):
         1. Asks for Administrator rights (Disable/Enable-PnpDevice need them).
-        2. Saves the current Windows display mode and backs up every VALORANT
-           "GameUserSettings.ini".
+        2. Saves the current Windows display mode, backs up every VALORANT
+           "GameUserSettings.ini" and patches the game settings (resolution,
+           Aspect Ratio, Display Mode).
         3. Disables the OTHER monitors, switches the game monitor to the target
            resolution (while its driver is still enabled so the custom mode is
            available), then disables the game monitor itself -> EDID gone -> TRUE
            stretch.
-        4. Patches VALORANT settings (resolution, Aspect Ratio, Display Mode).
-        5. Launches VALORANT and waits until it closes.
-        6. Re-enables the monitors, restores the original resolution and config.
+        4. Launches VALORANT and waits until it closes.
+        5. Re-enables the monitors, restores the original resolution and config.
 
     The rollback also runs if you press Ctrl+C while the game is running.
 
@@ -42,8 +42,9 @@
     Fullscreen | WindowedFullscreen | Windowed | Borderless. Overrides config.json.
 
 .PARAMETER MonitorMode
-    All (disable every monitor, default) | Target (only the game monitor) | None
-    (do not touch any monitor - useful for testing). Overrides config.json.
+    All (disable every monitor, default) | Target (only the game monitor) |
+    None (do not disable any monitor; the target resolution is still applied -
+    useful for testing). Overrides config.json.
 
 .PARAMETER DisplayDevice
     Force a display adapter, e.g. "\\.\DISPLAY1". Overrides config.json.
@@ -84,14 +85,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms | Out-Null
 
 # ---------------------------------------------------------------------------
 # Config loading (defaults -> config.json -> command line)
 # ---------------------------------------------------------------------------
 if (-not $Config) { $Config = Join-Path $PSScriptRoot 'config.json' }
 
-$defaults = [ordered]@{
+# Defaults; every key that is also present in config.json gets overridden.
+$cfg = [ordered]@{
     ResolutionWidth     = 1440
     ResolutionHeight    = 1080
     RefreshRate         = 0
@@ -108,14 +109,12 @@ $defaults = [ordered]@{
     PauseOnExit         = $true
 }
 
-$cfg = [ordered]@{}
-foreach ($k in $defaults.Keys) { $cfg[$k] = $defaults[$k] }
-
 if (Test-Path -LiteralPath $Config) {
     try {
         $json = Get-Content -LiteralPath $Config -Raw -ErrorAction Stop | ConvertFrom-Json
-        foreach ($k in $defaults.Keys) {
-            if (@($json.PSObject.Properties.Name) -contains $k) { $cfg[$k] = $json.$k }
+        $jsonKeys = @($json.PSObject.Properties.Name)
+        foreach ($k in @($cfg.Keys)) {
+            if ($jsonKeys -contains $k) { $cfg[$k] = $json.$k }
         }
     } catch {
         Write-Host "[4:3] WARNING: could not read config '$Config': $($_.Exception.Message)" -ForegroundColor Yellow
@@ -142,9 +141,18 @@ $DoPause      = [bool]$cfg['PauseOnExit'] -and (-not $NoPause)
 # ---------------------------------------------------------------------------
 $LogFile = Join-Path $env:TEMP 'Valorant-4x3-portable.log'
 $LogEnabled = [bool]$cfg['LogToFile']
-function Say  { param([string]$m) $line = "[4:3] $m"; Write-Host $line; if ($LogEnabled) { Add-Content -LiteralPath $LogFile -Value ((Get-Date -Format 'HH:mm:ss') + ' ' + $line) -ErrorAction SilentlyContinue } }
-function Warn { param([string]$m) $line = "[4:3] $m"; Write-Host $line -ForegroundColor Yellow; if ($LogEnabled) { Add-Content -LiteralPath $LogFile -Value ((Get-Date -Format 'HH:mm:ss') + ' WARN ' + $line) -ErrorAction SilentlyContinue } }
-function Good { param([string]$m) $line = "[4:3] $m"; Write-Host $line -ForegroundColor Green; if ($LogEnabled) { Add-Content -LiteralPath $LogFile -Value ((Get-Date -Format 'HH:mm:ss') + ' ' + $line) -ErrorAction SilentlyContinue } }
+function Write-Msg {
+    param([string]$m, [ConsoleColor]$Color = 'Gray', [string]$Tag = '')
+    $line = "[4:3] $m"
+    Write-Host $line -ForegroundColor $Color
+    if ($LogEnabled) {
+        $stamp = (Get-Date -Format 'HH:mm:ss') + $(if ($Tag) { " $Tag " } else { ' ' }) + $line
+        Add-Content -LiteralPath $LogFile -Value $stamp -ErrorAction SilentlyContinue
+    }
+}
+function Say  { param([string]$m) Write-Msg $m }
+function Warn { param([string]$m) Write-Msg $m -Color Yellow -Tag 'WARN' }
+function Good { param([string]$m) Write-Msg $m -Color Green }
 
 # ---------------------------------------------------------------------------
 # Administrator / self-elevation
@@ -283,30 +291,35 @@ public static class VDis
         return dm.dmPelsWidth + "|" + dm.dmPelsHeight + "|" + dm.dmDisplayFrequency;
     }
 
-    // Max refresh available for a given resolution, or -1 if the mode does not exist.
-    public static int FindMode(string dev, int w, int h)
+    static List<DEVMODE> EnumModes(string dev)
     {
+        var list = new List<DEVMODE>();
         short size = DevModeSize();
-        int best = -1;
         for (int i = 0; i < 10000; i++)
         {
             var dm = new DEVMODE(); dm.dmSize = size;
             if (!EnumDisplaySettings(dev, i, ref dm)) break;
+            list.Add(dm);
+        }
+        return list;
+    }
+
+    // Max refresh available for a given resolution, or -1 if the mode does not exist.
+    public static int FindMode(string dev, int w, int h)
+    {
+        int best = -1;
+        foreach (var dm in EnumModes(dev))
             if (dm.dmPelsWidth == w && dm.dmPelsHeight == h && dm.dmDisplayFrequency > best)
                 best = dm.dmDisplayFrequency;
-        }
         return best;
     }
 
     // Distinct "WxH" modes exposed by the display, sorted.
     public static string[] ListResolutions(string dev)
     {
-        short size = DevModeSize();
         var set = new List<string>();
-        for (int i = 0; i < 10000; i++)
+        foreach (var dm in EnumModes(dev))
         {
-            var dm = new DEVMODE(); dm.dmSize = size;
-            if (!EnumDisplaySettings(dev, i, ref dm)) break;
             string k = dm.dmPelsWidth + "x" + dm.dmPelsHeight;
             if (!set.Contains(k)) set.Add(k);
         }
@@ -314,45 +327,45 @@ public static class VDis
         return set.ToArray();
     }
 
-    // Find the requested mode (or the max refresh) and apply it. Fallback builds a
-    // DEVMODE from the current one if the mode is not listed.
+    // Find the requested mode (or the max refresh) and apply it. Falls back to building a
+    // DEVMODE from the current one when the driver does not list the mode.
     // Returns ChangeDisplaySettingsEx result (0 = success).
     public static int ApplyResolution(string dev, int w, int h, int hz)
     {
         short size = DevModeSize();
-        DEVMODE chosen = new DEVMODE();
-        bool found = false;
-        DEVMODE best = new DEVMODE(); int bestHz = -1;
+        DEVMODE best = new DEVMODE();
+        int bestHz = -1;
 
-        for (int i = 0; i < 10000; i++)
+        foreach (var dm in EnumModes(dev))
         {
-            var dm = new DEVMODE(); dm.dmSize = size;
-            if (!EnumDisplaySettings(dev, i, ref dm)) break;
-            if (dm.dmPelsWidth == w && dm.dmPelsHeight == h)
+            if (dm.dmPelsWidth != w || dm.dmPelsHeight != h) continue;
+            if (hz > 0)
             {
-                if (hz > 0) { if (dm.dmDisplayFrequency == hz) { chosen = dm; found = true; break; } }
-                else if (dm.dmDisplayFrequency > bestHz) { bestHz = dm.dmDisplayFrequency; best = dm; found = true; }
+                if (dm.dmDisplayFrequency == hz) { best = dm; bestHz = hz; break; }
+            }
+            else if (dm.dmDisplayFrequency > bestHz)
+            {
+                best = dm; bestHz = dm.dmDisplayFrequency;
             }
         }
-        if (found && bestHz >= 0) chosen = best;
 
-        if (!found)
+        if (bestHz < 0)
         {
             var cur = new DEVMODE(); cur.dmSize = size;
             if (!EnumDisplaySettings(dev, ENUM_CURRENT_SETTINGS, ref cur)) return -100;
             cur.dmPelsWidth = w;
             cur.dmPelsHeight = h;
             if (hz > 0) cur.dmDisplayFrequency = hz;
-            chosen = cur;
+            best = cur;
         }
 
-        chosen.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
-        if (chosen.dmDisplayFrequency > 0) chosen.dmFields |= DM_DISPLAYFREQUENCY;
-        return ChangeDisplaySettingsEx(dev, ref chosen, IntPtr.Zero, CDS_UPDATEREGISTRY, IntPtr.Zero);
+        best.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+        if (best.dmDisplayFrequency > 0) best.dmFields |= DM_DISPLAYFREQUENCY;
+        return ChangeDisplaySettingsEx(dev, ref best, IntPtr.Zero, CDS_UPDATEREGISTRY, IntPtr.Zero);
     }
 }
 '@
-Add-Type -TypeDefinition $win32
+if (-not ('VDis' -as [type])) { Add-Type -TypeDefinition $win32 }
 
 # ---------------------------------------------------------------------------
 # Display helpers
@@ -371,8 +384,12 @@ function Get-Displays {
     }
 }
 
+function Get-ValorantConfigRoot {
+    Join-Path $env:LOCALAPPDATA 'VALORANT\Saved\Config'
+}
+
 function Get-ConfigMonitorHwid {
-    $root = Join-Path $env:LOCALAPPDATA 'VALORANT\Saved\Config'
+    $root = Get-ValorantConfigRoot
     if (-not (Test-Path $root)) { return '' }
     $cf = Get-ChildItem $root -Recurse -Filter 'GameUserSettings.ini' -ErrorAction SilentlyContinue |
           Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -402,14 +419,8 @@ function Select-Target {
 function Resolve-Again {
     param([string]$Adapter, [string]$MonitorId, [string]$Hwid)
     $all = @(Get-Displays)
-    if ($Adapter) {
-        $d = $all | Where-Object { $_.Adapter -eq $Adapter } | Select-Object -First 1
-        if ($d) { return $d }
-    }
-    if ($MonitorId) {
-        $d = $all | Where-Object { $_.MonitorId -eq $MonitorId } | Select-Object -First 1
-        if ($d) { return $d }
-    }
+    if ($Adapter)   { $d = $all | Where-Object { $_.Adapter   -eq $Adapter   } | Select-Object -First 1; if ($d) { return $d } }
+    if ($MonitorId) { $d = $all | Where-Object { $_.MonitorId -eq $MonitorId } | Select-Object -First 1; if ($d) { return $d } }
     return (Select-Target -Requested '' -Hwid $Hwid)
 }
 
@@ -443,29 +454,31 @@ function Get-DisplayModeValue {
 
 function Update-ValorantConfig {
     param([string]$Path)
-    $fs  = Get-DisplayModeValue -Mode $cfg['DisplayMode']
-    $lb  = if ([bool]$cfg['AspectRatioFill']) { 'False' } else { 'True' }
+    $fs = Get-DisplayModeValue -Mode $cfg['DisplayMode']
+    $lb = if ([bool]$cfg['AspectRatioFill']) { 'False' } else { 'True' }
+    $values = [ordered]@{
+        ResolutionSizeX                  = $Width
+        ResolutionSizeY                  = $Height
+        LastUserConfirmedResolutionSizeX = $Width
+        LastUserConfirmedResolutionSizeY = $Height
+        bShouldLetterbox                 = $lb
+        bLastConfirmedShouldLetterbox    = $lb
+        FullscreenMode                   = $fs
+        PreferredFullscreenMode          = $fs
+        LastConfirmedFullscreenMode      = $fs
+    }
     $text = [System.IO.File]::ReadAllText($Path)
-    $text = Set-IniValue $text 'ResolutionSizeX'                  $Width
-    $text = Set-IniValue $text 'ResolutionSizeY'                  $Height
-    $text = Set-IniValue $text 'LastUserConfirmedResolutionSizeX' $Width
-    $text = Set-IniValue $text 'LastUserConfirmedResolutionSizeY' $Height
-    $text = Set-IniValue $text 'bShouldLetterbox'              $lb
-    $text = Set-IniValue $text 'bLastConfirmedShouldLetterbox' $lb
-    $text = Set-IniValue $text 'FullscreenMode'              $fs
-    $text = Set-IniValue $text 'PreferredFullscreenMode'     $fs
-    $text = Set-IniValue $text 'LastConfirmedFullscreenMode' $fs
+    foreach ($k in $values.Keys) { $text = Set-IniValue $text $k $values[$k] }
     [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.ASCIIEncoding))
 }
 
 function Get-ValorantConfigFiles {
-    $root = Join-Path $env:LOCALAPPDATA 'VALORANT\Saved\Config'
-    @(Get-ChildItem $root -Recurse -Filter 'GameUserSettings.ini' -ErrorAction SilentlyContinue | ForEach-Object FullName)
+    @(Get-ChildItem (Get-ValorantConfigRoot) -Recurse -Filter 'GameUserSettings.ini' -ErrorAction SilentlyContinue | ForEach-Object FullName)
 }
 
 function Backup-ValorantConfig {
     param([string[]]$Files, [string]$BackupRoot)
-    $root = Join-Path $env:LOCALAPPDATA 'VALORANT\Saved\Config'
+    $root = Get-ValorantConfigRoot
     foreach ($f in $Files) {
         $rel = $f.Substring($root.Length).TrimStart('\')
         $dst = Join-Path $BackupRoot $rel
@@ -476,7 +489,7 @@ function Backup-ValorantConfig {
 
 function Restore-ValorantConfig {
     param([string[]]$Files, [string]$BackupRoot)
-    $root = Join-Path $env:LOCALAPPDATA 'VALORANT\Saved\Config'
+    $root = Get-ValorantConfigRoot
     foreach ($f in $Files) {
         $rel = $f.Substring($root.Length).TrimStart('\')
         $src = Join-Path $BackupRoot $rel
@@ -533,11 +546,19 @@ $targetHwid = ''
 if ($target.MonitorId -match 'MONITOR\\([^\\]+)') { $targetHwid = $Matches[1] }
 
 $mm = [string]$cfg['MonitorMode']
-$toDisable = @(
-    if ($mm -eq 'None') { @() }
-    elseif ($mm -eq 'Target' -and $targetHwid) { $activeMonitors | Where-Object { $_.InstanceId -like "*$targetHwid*" } }
-    else { $activeMonitors }
-)
+$toDisable = @()
+if ($mm -eq 'None') {
+    # Leave every monitor alone (testing / already stretched).
+} elseif ($mm -eq 'Target') {
+    if ($targetHwid) {
+        $toDisable = @($activeMonitors | Where-Object { $_.InstanceId -like "*$targetHwid*" })
+    } else {
+        Warn 'MonitorMode=Target, but the game monitor could not be identified - disabling ALL monitors instead.'
+        $toDisable = @($activeMonitors)
+    }
+} else {
+    $toDisable = @($activeMonitors)
+}
 
 $availHz = [VDis]::FindMode($target.Adapter, $Width, $Height)
 
@@ -559,12 +580,16 @@ if ($DryRun) {
 }
 
 if ($availHz -le 0 -and $mm -ne 'None') {
-    Warn "Resolution ${Width}x${Height} is not available on $($target.Adapter)."
-    Warn 'Create it in your GPU control panel (NVIDIA: Change resolution -> Customize ->'
-    Warn '"Create Custom Resolution", tick "Resolutions not exposed by the display";'
-    Warn 'AMD: Display -> Custom Resolutions), set the target size and refresh, then Apply.'
-    Warn 'Nothing was changed - monitors were NOT touched.'
-    Warn ("Currently available modes: " + (([VDis]::ListResolutions($target.Adapter)) -join ', '))
+    Warn @"
+Resolution ${Width}x${Height} is not available on $($target.Adapter).
+Create it in your GPU control panel:
+  NVIDIA: Change resolution -> Customize -> "Create Custom Resolution",
+          tick "Resolutions not exposed by the display".
+  AMD:    Display -> Custom Resolutions.
+Set the target size and refresh, then Apply.
+Nothing was changed - monitors were NOT touched.
+Currently available modes: $(([VDis]::ListResolutions($target.Adapter)) -join ', ')
+"@
     if ($DoPause) { Read-Host 'Press Enter to close' }
     exit 1
 }
